@@ -9,6 +9,49 @@ sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from agent_loop import BaseHandler, StepOutcome, json_default
 script_dir = os.path.dirname(os.path.abspath(__file__))
 
+_SHELL_CMD_ALLOWLIST = [
+    # 系统信息
+    'date', 'time', 'whoami', 'hostname', 'ver', 'uname', 'lsb_release',
+    # 进程/资源
+    'ps', 'top', 'htop', 'df', 'du', 'free', 'w', 'uptime', 'tasklist',
+    # 网络
+    'ping', 'ipconfig', 'ifconfig', 'netstat', 'curl', 'wget',
+    # 文件操作（限定路径）
+    'ls', 'dir', 'find', 'grep', 'cat', 'head', 'tail', 'wc', 'sort', 'echo',
+    'mkdir', 'cp', 'mv', 'rm', 'touch', 'chmod',
+    # git
+    'git', 'git status', 'git log', 'git diff', 'git branch',
+    # node/python
+    'node', 'npm', 'python', 'pip',
+]
+
+def _validate_shell_command(code):
+    """校验 shell 命令，防止注入攻击。
+    只允许白名单命令 + 安全参数，拒绝管道/重定向/分号等注入向量。"""
+    stripped = code.strip()
+    if not stripped:
+        raise ValueError("shell 命令不能为空")
+    # 拒绝明显危险的操作
+    dangerous_patterns = [
+        '&&', '||', '`', '$(',  # 命令链接/注入
+        '2>', '>/dev/null',  # 重定向（> 和 >> 单独判断）
+        'rm -rf', 'rm -rf /', 'rm -r /',  # 危险删除
+        'mkfs', 'dd if=', 'format',  # 磁盘操作
+        ':(){ :|:& };:',  # fork bomb
+        '> /dev/', '> /etc/', '> /boot/',
+    ]
+    for pat in dangerous_patterns:
+        if pat in stripped.lower():
+            raise ValueError(f"shell 命令包含禁止模式: {pat!r}")
+    # 检查是否为白名单命令开头
+    first_word = stripped.split(maxsplit=1)[0].lower() if stripped else ''
+    if first_word in ('sudo', 'su'):  # 允许 sudo 但递归检查实际命令
+        parts = stripped.split(maxsplit=2)
+        if len(parts) >= 2:
+            first_word = parts[1].lower()
+    if not any(first_word == w or first_word.startswith(w) for w in _SHELL_CMD_ALLOWLIST):
+        raise ValueError(f"shell 命令不在白名单中: {first_word!r}")
+
 def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop_signal=[]):
     """代码执行器
     python: 运行复杂的 .py 脚本（文件模式）
@@ -24,8 +67,9 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
         tmp_file.write(code)
         tmp_path = tmp_file.name
         tmp_file.close()
-        cmd = [sys.executable, "-X", "utf8", "-u", tmp_path]   
+        cmd = [sys.executable, "-X", "utf8", "-u", tmp_path]
     elif code_type in ["powershell", "bash", "sh", "shell", "ps1", "pwsh"]:
+        _validate_shell_command(code)
         if os.name == 'nt': cmd = ["powershell", "-NoProfile", "-NonInteractive", "-Command", code]
         else: cmd = ["bash", "-c", code]
     else:
@@ -87,7 +131,9 @@ def code_run(code, code_type="python", timeout=60, cwd=None, code_cwd=None, stop
         if 'process' in locals(): process.kill()
         return {"status": "error", "msg": str(e)}
     finally:
-        if code_type == "python" and tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
+        if tmp_path and os.path.exists(tmp_path):
+            try: os.remove(tmp_path)
+            except: pass
 
 
 def ask_user(question, candidates=None):
@@ -97,18 +143,22 @@ def ask_user(question, candidates=None):
 
 import simphtml
 driver = None
+_driver_lock = threading.RLock()
 def first_init_driver():
     global driver
-    from TMWebDriver import TMWebDriver
-    driver = TMWebDriver()
-    for i in range(20):
-        time.sleep(1)
-        sess = driver.get_all_sessions()
-        if len(sess) > 0: break
-    if len(sess) == 0: return 
-    if len(sess) == 1: 
-        #driver.newtab()
-        time.sleep(3)
+    with _driver_lock:
+        if driver is not None:
+            return
+        from TMWebDriver import TMWebDriver
+        driver = TMWebDriver()
+        for i in range(20):
+            time.sleep(1)
+            sess = driver.get_all_sessions()
+            if len(sess) > 0: break
+        if len(sess) == 0: return
+        if len(sess) == 1:
+            #driver.newtab()
+            time.sleep(3)
 
 def web_scan(tabs_only=False, switch_tab_id=None, text_only=False):
     """获取当前页面的简化HTML内容和标签页列表。注意：简化过程会过滤边栏、浮动元素等非主体内容。
@@ -117,26 +167,30 @@ def web_scan(tabs_only=False, switch_tab_id=None, text_only=False):
     应当多用execute_js，少全量观察html"""
     global driver
     try:
-        if driver is None: first_init_driver()
-        if len(driver.get_all_sessions()) == 0:
-            return {"status": "error", "msg": "没有可用的浏览器标签页，查L3记忆分析原因。"}
-        tabs = []
-        for sess in driver.get_all_sessions(): 
-            sess.pop('connected_at', None)
-            sess.pop('type', None)
-            sess['url'] = sess.get('url', '')[:50] + ("..." if len(sess.get('url', '')) > 50 else "")
-            tabs.append(sess)
-        if switch_tab_id: driver.default_session_id = switch_tab_id
-        result = {
-            "status": "success",
-            "metadata": {
-                "tabs_count": len(tabs), "tabs": tabs,
-                "active_tab": driver.default_session_id
+        with _driver_lock:
+            if driver is None: first_init_driver()
+            if len(driver.get_all_sessions()) == 0:
+                return {"status": "error", "msg": "没有可用的浏览器标签页，查L3记忆分析原因。"}
+            tabs = []
+            for sess in driver.get_all_sessions():
+                sess.pop('connected_at', None)
+                sess.pop('type', None)
+                sess['url'] = sess.get('url', '')[:50] + ("..." if len(sess.get('url', '')) > 50 else "")
+                tabs.append(sess)
+            if switch_tab_id: driver.default_session_id = switch_tab_id
+            result = {
+                "status": "success",
+                "metadata": {
+                    "tabs_count": len(tabs), "tabs": tabs,
+                    "active_tab": driver.default_session_id
+                }
             }
-        }
-        if not tabs_only: 
-            importlib.reload(simphtml); result["content"] = simphtml.get_html(driver, cutlist=True, maxchars=35000, text_only=text_only)
-            if text_only: result['content'] = smart_format(result['content'], max_str_len=10000, omit_str='\n\n[omitted long content]\n\n')
+            if not tabs_only:
+                importlib.reload(simphtml)
+                content = simphtml.get_html(driver, cutlist=True, maxchars=35000, text_only=text_only)
+                result["content"] = content
+                if text_only:
+                    result['content'] = smart_format(result['content'], max_str_len=10000, omit_str='\n\n[omitted long content]\n\n')
         return result
     except Exception as e:
         return {"status": "error", "msg": format_error(e)}
@@ -164,10 +218,11 @@ def web_execute_js(script, switch_tab_id=None, no_monitor=False):
     """执行 JS 脚本来控制浏览器，并捕获结果和页面变化"""
     global driver
     try:
-        if driver is None: first_init_driver()
-        if len(driver.get_all_sessions()) == 0: return {"status": "error", "msg": "没有可用的浏览器标签页，查L3记忆分析原因。"}
-        if switch_tab_id: driver.default_session_id = switch_tab_id
-        result = simphtml.execute_js_rich(script, driver, no_monitor=no_monitor)
+        with _driver_lock:
+            if driver is None: first_init_driver()
+            if len(driver.get_all_sessions()) == 0: return {"status": "error", "msg": "没有可用的浏览器标签页，查L3记忆分析原因。"}
+            if switch_tab_id: driver.default_session_id = switch_tab_id
+            result = simphtml.execute_js_rich(script, driver, no_monitor=no_monitor)
         return result
     except Exception as e: return {"status": "error", "msg": format_error(e)}
 
